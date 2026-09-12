@@ -14,6 +14,7 @@
 | **L5 / Senior** | + Generic envelope, middleware pipeline, Outbox, ordered processing, DDD |
 | **L6 / Staff** | + Dynamic dispatch, distributed guards, exactly-once semantics |
 | **Interview ops** | 45-min pacing, sequence diagram, test code, Polly resilience |
+| **Architect / Lead** | Schema versioning, observability (OTel), scale & partitioning, security, operational runbook |
 
 ---
 
@@ -56,6 +57,12 @@
 26. [Polly Retry & Circuit Breaker](#26-polly-retry--circuit-breaker)
 27. [Q&A Bank](#27-qa-bank)
 
+**— Architect / Lead Perspective —**
+
+28. [Schema Versioning & Backward Compatibility](#28-schema-versioning--backward-compatibility)
+29. [Observability — OpenTelemetry, Health Checks, DLQ Alerting](#29-observability--opentelemetry-health-checks-dlq-alerting)
+30. [Scale, Security & Operational Runbook](#30-scale-security--operational-runbook)
+
 ---
 
 ## 1. Problem Statement
@@ -83,6 +90,38 @@ An Azure Function receives JSON messages from a Service Bus topic. Each message 
 5. Log at each step; never crash the host on bad messages.
 
 **Hard constraint:** Business logic must not depend on `ServiceBusReceivedMessage` or a concrete `HttpClient`.
+
+### System Architecture Overview
+
+```mermaid
+graph TD
+    Producer["Upstream Systems\n(Order API / ERP)"]
+    SB["Azure Service Bus\nTopic + Subscription"]
+    Fn["Azure Function\nMessageProcessorFunction"]
+    TR["JsonMessageTypeResolver\nPeeks at dataType discriminator"]
+    DP["MessageProcessorDispatcher\nRoutes by DataTypeEnum"]
+    P1["OrderConfirmationProcessor"]
+    P2["OrderDeliveryProcessor"]
+    P3["OrderInvoiceProcessor"]
+    FW["HttpMessageForwarder\nPOST via IHttpClientFactory"]
+    DS1["Confirmation API"]
+    DS2["Delivery API"]
+    DS3["Invoice API"]
+    DLQ["Dead-Letter Queue\nInvalid messages"]
+    CFG["IOptions&lt;MessageProcessorOptions&gt;\nEndpoint URLs from config"]
+
+    Producer -->|"publish JSON message"| SB
+    SB -->|"ServiceBusReceivedMessage"| Fn
+    Fn --> TR
+    TR -->|"DataTypeEnum"| DP
+    DP -->|"OrderConfirmation"| P1
+    DP -->|"OrderDelivery"| P2
+    DP -->|"OrderInvoice"| P3
+    P1 & P2 & P3 -->|"ProcessedMessage&lt;T&gt;"| FW
+    FW -->|"POST"| DS1 & DS2 & DS3
+    Fn -->|"InvalidMessageException"| DLQ
+    CFG -.->|"injected"| Fn
+```
 
 ---
 
@@ -119,26 +158,20 @@ These axes map directly to design decisions:
 
 ## 4. Layer Model
 
-```
-┌──────────────────────────────────────────────────────────┐
-│ Layer 1 — Entry Point (Thin Trigger)                     │
-│ Receives raw bytes; owns dead-letter decision only       │
-├──────────────────────────────────────────────────────────┤
-│ Layer 2 — Routing (IMessageTypeResolver)                 │
-│ Peeks at discriminator — no full parse yet               │
-├──────────────────────────────────────────────────────────┤
-│ Layer 3 — Parse + Validate (MessageProcessorBase<T>)     │
-│ Deserialize → DataAnnotations validation                 │
-├──────────────────────────────────────────────────────────┤
-│ Layer 4 — Process (Concrete Processors)                  │
-│ Type-specific business logic; returns ProcessedMessage<T>│
-├──────────────────────────────────────────────────────────┤
-│ Layer 5 — Dispatch (IMessageProcessorDispatcher)         │
-│ Routes DataTypeEnum → IProcessor<T>; boxes result        │
-├──────────────────────────────────────────────────────────┤
-│ Layer 6 — Forward (IMessageForwarder)                    │
-│ HTTP POST via IHttpClientFactory                         │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+block-beta
+    columns 1
+    L1["Layer 1 — Entry Point (Thin Trigger)\nMessageProcessorFunction\nReceives raw bytes · owns dead-letter decision only"]
+    space
+    L2["Layer 2 — Routing\nJsonMessageTypeResolver\nPeeks at discriminator · no full parse yet"]
+    space
+    L3["Layer 3 — Parse + Validate\nMessageProcessorBase&lt;T&gt;\nDeserialize JSON · run DataAnnotations validation"]
+    space
+    L4["Layer 4 — Process\nOrderConfirmationProcessor · OrderDeliveryProcessor · OrderInvoiceProcessor\nType-specific business logic · returns ProcessedMessage&lt;T&gt;"]
+    space
+    L5["Layer 5 — Dispatch\nMessageProcessorDispatcher\nRoutes DataTypeEnum → IProcessor&lt;T&gt; · boxes result to object"]
+    space
+    L6["Layer 6 — Forward\nHttpMessageForwarder\nHTTP POST via IHttpClientFactory"]
 ```
 
 ---
@@ -181,6 +214,61 @@ public class OrderInvoiceData : BaseData
     [Required] public long? InvoiceNumber { get; set; }
     [Required] public InvoiceStatusEnum? InvoiceStatus { get; set; }
 }
+```
+
+### Data Model Inheritance
+
+```mermaid
+classDiagram
+    direction TB
+
+    class BaseData {
+        &lt;&lt;abstract&gt;&gt;
+        +long? OrderId
+        +DateTime? CreateAtUtc
+        +string? CreatedBy
+        +Guid? MessageCorelationId
+    }
+
+    class OrderConfirmationData {
+        +long? ConfirmationNumber
+        +DateTime? ConfirmationDateUtc
+        +ConfirmationStatusEnum? ConfirmationStatus
+    }
+
+    class OrderDeliveryData {
+        +DeliveryStatusEnum? DeliveryStatus
+        +DateTime? DeliveryDateUtc
+        +string? DeliveryAddress
+        +long? DeliveryTrackingNumber
+    }
+
+    class OrderInvoiceData {
+        +decimal? Amount
+        +string? Currency
+        +DateTime? InvoiceDateUtc
+        +long? InvoiceNumber
+        +InvoiceStatusEnum? InvoiceStatus
+    }
+
+    class SystemMessage~T~ {
+        +DataTypeEnum DataType
+        +T Data
+    }
+
+    class ProcessedMessage~T~ {
+        +DataTypeEnum DataType
+        +T Data
+        +string Summary
+        +DateTimeOffset ProcessedAtUtc
+        +Create(SystemMessage~T~, string) ProcessedMessage~T~$
+    }
+
+    BaseData <|-- OrderConfirmationData
+    BaseData <|-- OrderDeliveryData
+    BaseData <|-- OrderInvoiceData
+    SystemMessage~T~ --> BaseData : T constrained to
+    ProcessedMessage~T~ --> BaseData : T constrained to
 ```
 
 > **Why nullable `[Required]`?** Deserialization succeeds even when fields are absent. The validator — not the deserializer — produces the user-friendly error message.
@@ -441,13 +529,24 @@ builder.Services.AddSingleton<IProcessor<OrderInvoiceData>,      OrderInvoicePro
 | `InvalidOperationException` | Missing config | **Bubble up** → alert ops |
 | Any other | Bug in processor | **Bubble up** → retry → eventually dead-letter |
 
-```
-Raw message arrives
-  ├─ invalid JSON / unknown dataType     → InvalidMessageException → dead-letter
-  ├─ missing endpoint URL in config      → InvalidOperationException → ops alert
-  ├─ missing required payload field      → InvalidMessageException → dead-letter
-  ├─ downstream HTTP 5xx                 → HttpRequestException → Service Bus retries
-  └─ success                             → message completed ✅
+### Error Routing Flowchart
+
+```mermaid
+flowchart TD
+    A(["Message arrives\nfrom Service Bus"]) --> B{Valid JSON?}
+    B -- No --> DL1["InvalidMessageException\n→ DeadLetterMessageAsync"]
+    B -- Yes --> C{Known dataType?}
+    C -- No --> DL1
+    C -- Yes --> D{Endpoint URL\nin config?}
+    D -- No --> OPS["InvalidOperationException\n→ bubbles up\n→ alert ops"]
+    D -- Yes --> E{All required fields\npresent and valid?}
+    E -- No --> DL1
+    E -- Yes --> F{HTTP POST\nto downstream}
+    F -- "2xx" --> OK(["✅ Complete message"])
+    F -- "4xx" --> DL2["Unrecoverable downstream error\n→ bubbles up\n→ retry → DLQ"]
+    F -- "5xx / timeout" --> RT["HttpRequestException\n→ bubbles up\n→ Service Bus retries\n(up to MaxDeliveryCount)"]
+    RT -- "retries exhausted" --> DLQ(["Dead-Letter Queue"])
+    DL1 --> DLQ
 ```
 
 ---
@@ -713,6 +812,37 @@ public class MessagePipeline
 }
 ```
 
+### Middleware Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant SB as Service Bus
+    participant Log as CorrelationLogging MW
+    participant OG as OrderGuard MW
+    participant OB as Outbox MW
+    participant H as Handler
+
+    SB->>Log: InvokeAsync(message, next)
+    Note over Log: BeginScope(CorrelationId, MessageType)
+    Log->>OG: next(message)
+    OG->>OG: CanProcessAsync → Redis check
+    alt out-of-order or duplicate
+        OG-->>SB: DeferAsync / skip
+    else valid and in-order
+        OG->>OB: next(message)
+        OB->>H: next(message)
+        H->>H: load aggregate → call method → save
+        H-->>OB: success
+        OB->>OB: PublishPendingAsync → fire integrations
+        OB-->>OG: success
+        OG->>OG: MarkProcessedAsync → update Redis
+        OG-->>Log: success
+        Log-->>SB: Complete ✅
+    end
+
+    Note over OG,H: If handler throws, Outbox & MarkProcessed are NOT called
+```
+
 Execution order: `Logging → OrderGuard → Outbox → Handler → Outbox → OrderGuard → Logging`
 
 ---
@@ -741,17 +871,29 @@ public interface IOutboxService
 
 Send `EntryId` as `Idempotency-Key` header → downstream deduplicates on retries.
 
-**Recovery flow:**
+### Outbox Guarantee Flow
 
-```
-Handler writes DB + OutboxEntry (same transaction) ✅
-  │
-  ▼ OutboxMiddleware calls PublishPendingAsync
-  ├─ HTTP succeeds → mark IsPublished = true ✅
-  └─ HTTP fails   → entry stays unpublished
-                      │
-                      ▼ background IHostedService sweeper (every 30s)
-                      └─ retry with same EntryId as Idempotency-Key ✅
+```mermaid
+flowchart LR
+    subgraph Transaction ["DB Transaction (atomic)"]
+        H["Handler\nupsert order status"]
+        OE["Write OutboxEntry\nIsPublished = false"]
+        H --> OE
+    end
+
+    OE --> Commit["db.SaveChangesAsync()"]
+    Commit --> Pub["OutboxMiddleware\nPublishPendingAsync"]
+
+    Pub --> HTTP{HTTP call\nto downstream}
+    HTTP -- "2xx" --> Mark["Mark IsPublished = true"]
+    HTTP -- "failure" --> Unpub["Entry stays\nIsPublished = false"]
+
+    Unpub --> Sweeper["Background IHostedService\nsweeper every 30s"]
+    Sweeper --> Retry{Retry HTTP\nwith EntryId\nas Idempotency-Key}
+    Retry -- "2xx" --> Mark
+    Retry -- "failure" --> Unpub
+
+    style Transaction fill:#f0f4ff,stroke:#6688cc
 ```
 
 ---
@@ -1016,29 +1158,36 @@ public class EfOrderRepository : IOrderRepository
 
 ## 21. Layered Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ Trigger Layer                                                   │
-│  MessageProcessorFunction                                       │
-│  Knows: Azure SDK, IMessageDispatcher                           │
-│  Does NOT know: Order, Invoice, Money                           │
-├─────────────────────────────────────────────────────────────────┤
-│ Application Layer                                               │
-│  Handlers: load aggregate → call method → save                 │
-│  Knows: IOrderRepository, IDomainEventDispatcher               │
-│  Does NOT know: EF Core, Redis, HttpClient                      │
-├─────────────────────────────────────────────────────────────────┤
-│ Domain Layer                              ← pure C#, zero deps  │
-│  Aggregates: Order, Invoice                                     │
-│  Value Objects: OrderId, Money, TrackingNumber, DeliveryAddress │
-│  Domain Events: OrderConfirmedEvent, OrderShippedEvent, ...     │
-│  Repository interfaces: IOrderRepository, IInvoiceRepository    │
-├─────────────────────────────────────────────────────────────────┤
-│ Infrastructure Layer                                            │
-│  EfOrderRepository, RedisOrderGuard, HttpMessageForwarder       │
-│  OutboxService, OutboxSweeper (IHostedService)                  │
-│  DomainEventDispatcher                                          │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Trigger["Trigger Layer"]
+        TL["MessageProcessorFunction\n✓ Azure SDK\n✓ IMessageDispatcher\n✗ Order, Invoice, Money"]
+    end
+
+    subgraph App["Application Layer"]
+        AL["Handlers\nOrderConfirmedHandler · OrderShippedHandler\n✓ IOrderRepository · IDomainEventDispatcher\n✗ EF Core · Redis · HttpClient"]
+    end
+
+    subgraph Domain["Domain Layer  ←  pure C#, zero external dependencies"]
+        direction LR
+        AGG["Aggregates\nOrder · Invoice"]
+        VO["Value Objects\nOrderId · Money\nTrackingNumber · DeliveryAddress"]
+        DE["Domain Events\nOrderConfirmedEvent\nOrderShippedEvent · ..."]
+        RI["Repository Interfaces\nIOrderRepository\nIInvoiceRepository"]
+    end
+
+    subgraph Infra["Infrastructure Layer"]
+        IL["EfOrderRepository · EfInvoiceRepository\nRedisOrderGuard\nHttpMessageForwarder\nOutboxService · OutboxSweeper\nDomainEventDispatcher"]
+    end
+
+    Trigger --> App
+    App --> Domain
+    Infra --> Domain
+
+    style Domain fill:#e8f5e9,stroke:#388e3c
+    style Trigger fill:#e3f2fd,stroke:#1976d2
+    style App fill:#fff8e1,stroke:#f9a825
+    style Infra fill:#fce4ec,stroke:#c62828
 ```
 
 **DDD self-check before presenting your design:**
@@ -1408,3 +1557,307 @@ Polly retries 3 times with exponential backoff. Circuit breaker opens after 5 fa
 | Observability | `Console.WriteLine` | `ILogger` | `CorrelationId` scope + `X-Correlation-ID` propagation |
 | DDD | Anemic data bags | Some encapsulation | Value Objects + Aggregates + Domain Events |
 | Communication | Writes silently | Explains what | Names patterns before coding; explains trade-offs |
+| **Schema versioning** | Not considered | Additive-only changes | Versioned envelope + tolerant reader + contract tests |
+| **Observability** | `Console.WriteLine` | `ILogger` + correlation | OTel spans, health checks, DLQ metric alerts |
+| **Scale / Security** | Not considered | Mentions concurrency | Partition key, managed identity, payload limits, replay runbook |
+
+---
+
+## 28. Schema Versioning & Backward Compatibility
+
+> **Architect question:** "A new field is added to `OrderConfirmationData`. Old producers are still publishing the old schema. What breaks and how do you prevent it?"
+
+### The Problem
+
+```jsonc
+// Old producer — no confirmationChannel field
+{ "dataType": "OrderConfirmation", "data": { "confirmationNumber": 1 } }
+
+// New producer — adds confirmationChannel
+{ "dataType": "OrderConfirmation", "data": { "confirmationNumber": 1, "confirmationChannel": "EMAIL" } }
+```
+
+If `[Required]` is added to `ConfirmationChannel`, every old-producer message **dead-letters immediately**. This is a silent breaking change.
+
+### Strategy 1 — Additive-only (always the first choice)
+
+Never add `[Required]` to a field that didn't exist before. New optional fields are nullable with no annotation:
+
+```csharp
+public class OrderConfirmationData : BaseData
+{
+    [Required] public long? ConfirmationNumber { get; set; }
+    [Required] public ConfirmationStatusEnum? ConfirmationStatus { get; set; }
+
+    // New optional field — no [Required]; old messages deserialize null, processor handles it
+    public string? ConfirmationChannel { get; set; }
+}
+```
+
+### Strategy 2 — Envelope versioning (for breaking changes)
+
+Add `SchemaVersion` to `SystemMessage<T>`. Route to version-specific processors:
+
+```csharp
+public class SystemMessage<T> where T : BaseData, new()
+{
+    public required DataTypeEnum DataType { get; set; }
+    public required T Data { get; set; }
+    public int SchemaVersion { get; set; } = 1;  // default 1 for backward compat
+}
+```
+
+```csharp
+// Dispatcher branches on version
+public Task<object> ProcessAsync(DataTypeEnum dataType, int schemaVersion, string body, CancellationToken ct)
+    => (dataType, schemaVersion) switch
+    {
+        (DataTypeEnum.OrderConfirmation, 1) => BoxAsync(_confirmationV1Processor.ProcessAsync(body, ct)),
+        (DataTypeEnum.OrderConfirmation, 2) => BoxAsync(_confirmationV2Processor.ProcessAsync(body, ct)),
+        _ => throw new InvalidMessageException($"No processor for {dataType} v{schemaVersion}.")
+    };
+```
+
+### Strategy 3 — Tolerant reader
+
+Deserialize permissively and ignore unknown fields — the consumer is not broken by producer additions:
+
+```csharp
+private static JsonSerializerOptions BuildSerializerOptions()
+{
+    var o = new JsonSerializerOptions
+    {
+        PropertyNameCaseInsensitive = true,
+        UnmappedMemberHandling = JsonUnmappedMemberHandling.Skip,  // ignore new fields from newer producers
+    };
+    o.Converters.Add(new JsonStringEnumConverter());
+    return o;
+}
+```
+
+### Contract Testing
+
+Prevent schema breakage at CI time using **Pact** (consumer-driven contracts) or a **JSON Schema registry**:
+
+```mermaid
+flowchart LR
+    P["Producer CI\npublishes schema v2"] -->|"contract file"| PR["Pact Broker\n/ Schema Registry"]
+    PR -->|"verify against"| C["Consumer CI\nruns contract test"]
+    C -- "consumer breaks" --> FAIL["❌ Build fails\nbefore deployment"]
+    C -- "consumer passes" --> OK["✅ Safe to deploy"]
+```
+
+**Architect answer:** "Additive-only changes are the team convention, enforced by a linter. For breaking changes I version the envelope and run parallel consumers during the transition window. Contract tests in CI prevent the producer from publishing a schema the consumer cannot read."
+
+---
+
+## 29. Observability — OpenTelemetry, Health Checks, DLQ Alerting
+
+> **Architect question:** "Production shows 30-second spikes in message processing time. How do you diagnose which layer is slow?"
+
+### Distributed Tracing with OpenTelemetry
+
+`ILogger` gives you log correlation. OpenTelemetry gives you **span timing per layer** — you can pinpoint whether the spike is in deserialization, the processor, or the HTTP forward.
+
+```csharp
+// Program.cs
+builder.Services.AddOpenTelemetry()
+    .WithTracing(t => t
+        .AddSource("MessagesProcessor")
+        .AddHttpClientInstrumentation()      // traces HttpMessageForwarder calls automatically
+        .AddAzureMonitorTraceExporter());
+
+// MessageProcessorFunction.Run()
+using var activity = ActivitySource.StartActivity("ProcessMessage");
+activity?.SetTag("message.type", dataType.ToString());
+activity?.SetTag("message.id", message.MessageId);
+```
+
+```mermaid
+gantt
+    title Single message trace — Application Insights
+    dateFormat  x
+    axisFormat  %Lms
+
+    section Pipeline
+    ResolveDataType     : 0, 1
+    GetEndpointUrl      : 1, 1
+    ProcessAsync        : 2, 3
+    ForwardAsync        : 5, 28
+```
+
+The Gantt shows `ForwardAsync` taking 28ms — the downstream HTTP call is the spike, not the processor.
+
+### Health Checks
+
+```csharp
+builder.Services.AddHealthChecks()
+    .AddAzureServiceBusSubscription("<sb-conn>", "mytopic", "mysubscription", name: "servicebus")
+    .AddRedis("<redis-conn>", name: "redis")
+    .AddUrlGroup(new Uri("https://downstream/health"), name: "downstream-api");
+
+app.MapHealthChecks("/health");
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+    { Predicate = c => c.Tags.Contains("ready") });
+```
+
+### Dead-Letter Queue Alerting
+
+DLQ filling silently is the most common production incident. Add a metric alert before it becomes a crisis:
+
+```
+Azure Monitor Alert Rule:
+  Metric:   DeadLetteredMessageCount
+  Operator: GreaterThan
+  Threshold: 10
+  Window:   5 minutes
+  Action:   notify on-call channel
+```
+
+Also emit a custom metric on every dead-letter:
+
+```csharp
+// In MessageProcessorFunction before DeadLetterMessageAsync
+_telemetryClient.TrackMetric("MessageDeadLettered", 1,
+    new Dictionary<string, string> { ["DataType"] = dataType?.ToString() ?? "Unknown" });
+```
+
+### Structured Log Queries (KQL)
+
+```kusto
+// Dead-letters by type — last 1 hour
+traces
+| where timestamp > ago(1h) and message contains "Dead-lettering"
+| extend dataType = tostring(customDimensions["DataType"])
+| summarize count() by dataType, bin(timestamp, 5m)
+| render timechart
+
+// P99 processing latency per message type
+traces
+| where message contains "[END]"
+| extend ms = toint(extract("(\\d+)ms", 1, message))
+| extend msgType = tostring(customDimensions["MessageType"])
+| summarize percentile(ms, 99) by msgType
+```
+
+---
+
+## 30. Scale, Security & Operational Runbook
+
+### Scale & Throughput
+
+#### Service Bus session strategy
+
+| Scenario | Config |
+|----------|--------|
+| No ordering required | Non-session topic; Function scales to N instances for max throughput |
+| Per-order ordering | Session-enabled topic; `SessionId = OrderId`; one session per instance |
+| Per-type ordering + high volume | Separate subscription per type; dedicated Function per subscription |
+
+#### Concurrency settings (`host.json`)
+
+```json
+{
+  "extensions": {
+    "serviceBus": {
+      "maxConcurrentCalls": 16,
+      "maxConcurrentSessions": 8,
+      "prefetchCount": 50
+    }
+  }
+}
+```
+
+#### KEDA scale-out
+
+```mermaid
+graph LR
+    SB["Service Bus\nmessage backlog"] -->|"backlog > N per instance"| KEDA["KEDA Scale Controller"]
+    KEDA -->|"scale out"| F1["Function Instance 1"]
+    KEDA -->|"scale out"| F2["Function Instance 2"]
+    KEDA -->|"scale out"| FN["Function Instance N"]
+```
+
+Starting point: `messageCount: 100` per instance. Tune from load test results.
+
+### Security
+
+#### Managed Identity over connection strings
+
+```csharp
+// ❌ Connection string — still a secret, rotation burden
+"ServiceBusConnection": "Endpoint=sb://..."
+
+// ✅ Managed Identity — no secret, no rotation, no leakage
+"ServiceBusConnection__fullyQualifiedNamespace": "mynamespace.servicebus.windows.net"
+```
+
+Assign the Function's managed identity the **Azure Service Bus Data Receiver** role. SDK picks up `DefaultAzureCredential` automatically.
+
+#### Key Vault for secrets
+
+```csharp
+// Program.cs — pull secrets from Key Vault at startup
+builder.Configuration.AddAzureKeyVault(
+    new Uri("https://myvault.vault.azure.net/"),
+    new DefaultAzureCredential());
+```
+
+#### Payload as untrusted input
+
+The `Validate()` step in `MessageProcessorBase<T>` is a **security boundary**, not just business validation:
+- `[MaxLength]` on strings prevents memory exhaustion from oversized payloads
+- `[Range]` on numerics prevents arithmetic overflow
+- Never log raw payload body at `Information` — it may contain PII; log only message ID and type
+
+### Operational Runbook
+
+#### Pre-deployment checklist
+
+- [ ] `ValidateOnStart()` enabled — bad config fails at boot
+- [ ] `MaxDeliveryCount` tuned (not left at default 10)
+- [ ] DLQ metric alert configured in Azure Monitor
+- [ ] Managed Identity used — no connection strings in config
+- [ ] `local.settings.json` in `.gitignore`; `.example` file committed
+- [ ] `maxConcurrentCalls` set in `host.json`
+- [ ] `UnmappedMemberHandling.Skip` — tolerant to new producer fields
+- [ ] OpenTelemetry wired — spikes diagnosable in Application Insights
+- [ ] `/health` endpoint exposed and monitored
+
+#### Dead-letter drain and replay
+
+```csharp
+// Admin tool: re-enqueue DLQ messages after root cause is fixed
+public class DeadLetterReplayer
+{
+    public async Task ReplayAsync(string topicName, string subscriptionName, CancellationToken ct)
+    {
+        var receiver = _client.CreateReceiver(topicName, subscriptionName,
+            new ServiceBusReceiverOptions { SubQueue = SubQueue.DeadLetter });
+
+        await foreach (var message in receiver.ReceiveMessagesAsync(ct))
+        {
+            var sender = _client.CreateSender(topicName);
+            await sender.SendMessageAsync(new ServiceBusMessage(message.Body)
+            {
+                CorrelationId = message.CorrelationId,
+                ApplicationProperties = { ["replayed"] = true },
+            }, ct);
+            await receiver.CompleteMessageAsync(message, ct);
+        }
+    }
+}
+```
+
+#### Incident decision tree
+
+```mermaid
+flowchart TD
+    A(["DLQ messages\npiling up"]) --> B{Check dead-letter\nreason property}
+    B -->|"Invalid message"| C["Bad schema / missing field\n→ fix upstream producer\n→ replay after fix"]
+    B -->|"MaxDeliveryCountExceeded"| D{Check downstream\nendpoint health}
+    D -->|"Endpoint down"| E["Wait for recovery\nOutbox sweeper drains backlog\nautomatically on recovery"]
+    D -->|"Endpoint 4xx"| F["Payload contract changed\n→ check contract test failures\n→ fix consumer or producer"]
+    D -->|"Endpoint healthy"| G["Check circuit breaker state\nCheck processor logs for\nNullRef / exception"]
+    C & E & F & G --> R["Fix root cause\n→ run DeadLetterReplayer\n(dry-run first)"]
+```
