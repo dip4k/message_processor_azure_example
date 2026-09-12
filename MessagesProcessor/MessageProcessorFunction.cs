@@ -5,31 +5,46 @@ using MessagesProcessor.MessageProcessor;
 using MessagesProcessor.Messages;
 
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace MessagesProcessor;
 
+// ── Entry point — thin Azure Function trigger ────────────────────────────────
+// Responsibility: receive raw bytes, orchestrate the pipeline, handle
+// infrastructure-level errors (dead-letter vs bubble-up for retry).
+// It must NOT contain business logic — all rules live in the domain layer.
+//
+// Pipeline flow:
+//   1. ResolveDataType   → peek at discriminator (no full parse yet)
+//   2. GetEndpointUrl    → config lookup; throws on missing key (ops alert)
+//   3. ProcessAsync      → typed deserialize + validate + process (dispatcher)
+//   4. ForwardAsync      → HTTP POST to downstream endpoint
+//
+// Error routing:
+//   InvalidMessageException      → dead-letter (bad message, never retry)
+//   HttpRequestException         → bubble up → Service Bus retries
+//   InvalidOperationException    → bubble up → alert ops (config bug)
 public class MessageProcessorFunction
 {
     private readonly ILogger<MessageProcessorFunction> _logger;
-    private readonly IMessageTypeResolver _messageTypeResolver;
-    private readonly IMessageProcessorDispatcher _messageProcessorDispatcher;
-    private readonly IMessageForwarder _messageForwarder;
+    private readonly IMessageTypeResolver _typeResolver;
+    private readonly IMessageProcessorDispatcher _dispatcher;
+    private readonly IMessageForwarder _forwarder;
     private readonly IOptions<MessageProcessorOptions> _options;
 
     public MessageProcessorFunction(
         ILogger<MessageProcessorFunction> logger,
-        IMessageTypeResolver messageTypeResolver,
-        IMessageProcessorDispatcher messageProcessorDispatcher,
-        IMessageForwarder messageForwarder,
+        IMessageTypeResolver typeResolver,
+        IMessageProcessorDispatcher dispatcher,
+        IMessageForwarder forwarder,
         IOptions<MessageProcessorOptions> options)
     {
-        _logger = logger;
-        _messageTypeResolver = messageTypeResolver;
-        _messageProcessorDispatcher = messageProcessorDispatcher;
-        _messageForwarder = messageForwarder;
-        _options = options;
+        _logger      = logger;
+        _typeResolver = typeResolver;
+        _dispatcher  = dispatcher;
+        _forwarder   = forwarder;
+        _options     = options;
     }
 
     [Function(nameof(MessageProcessorFunction))]
@@ -39,51 +54,54 @@ public class MessageProcessorFunction
         ServiceBusMessageActions messageActions,
         CancellationToken cancellationToken)
     {
-        _logger.LogInformation("Message ID: {MessageId}", message.MessageId);
-        _logger.LogInformation("Message Content-Type: {ContentType}", message.ContentType);
+        _logger.LogInformation("Received message {MessageId} (ContentType: {ContentType})",
+            message.MessageId, message.ContentType);
 
-        var payloadString = message.Body.ToString();
-        _logger.LogDebug("Received message body: {Body}", payloadString);
+        var payload = message.Body.ToString();
 
         try
         {
-            var dataType = _messageTypeResolver.ResolveDataType(payloadString);
-            _logger.LogInformation("Resolved data type {DataType} for message {MessageId}", dataType, message.MessageId);
+            // ── Step 1: Resolve type from discriminator ───────────────────
+            var dataType = _typeResolver.ResolveDataType(payload);
+            _logger.LogInformation("Resolved {DataType} for message {MessageId}", dataType, message.MessageId);
 
+            // ── Step 2: Look up the downstream endpoint ───────────────────
             var endpointUrl = GetEndpointUrl(dataType);
-            var processedMessage = await _messageProcessorDispatcher.ProcessAsync(dataType, payloadString, cancellationToken);
 
-            _logger.LogInformation(
-                "Forwarding processed {DataType} message {MessageId} to {EndpointUrl}",
-                dataType,
-                message.MessageId,
-                endpointUrl);
+            // ── Step 3: Deserialize, validate, process ────────────────────
+            var result = await _dispatcher.ProcessAsync(dataType, payload, cancellationToken);
 
-            await _messageForwarder.ForwardAsync(endpointUrl, processedMessage, cancellationToken);
+            // ── Step 4: Forward to downstream system ──────────────────────
+            _logger.LogInformation("Forwarding {DataType} {MessageId} → {EndpointUrl}",
+                dataType, message.MessageId, endpointUrl);
+
+            await _forwarder.ForwardAsync(endpointUrl, result, cancellationToken);
 
             _logger.LogInformation("Message {MessageId} processed and forwarded successfully.", message.MessageId);
         }
         catch (InvalidMessageException ex)
         {
-            _logger.LogWarning(ex, "Rejecting invalid message {MessageId}.", message.MessageId);
+            // Structural problem — retrying will never help; dead-letter immediately
+            _logger.LogWarning(ex, "Dead-lettering invalid message {MessageId}.", message.MessageId);
             await messageActions.DeadLetterMessageAsync(
                 message,
                 deadLetterReason: "Invalid message",
                 deadLetterErrorDescription: ex.Message,
                 cancellationToken: cancellationToken);
         }
+        // All other exceptions bubble up → Service Bus applies retry + eventual DLQ
     }
 
+    // ── Config helper ─────────────────────────────────────────────────────────
+    // Throws InvalidOperationException (not InvalidMessageException) because a
+    // missing URL is a deployment/config bug, not a bad message.
     private string GetEndpointUrl(DataTypeEnum dataType)
     {
-        var endpointUrls = _options.Value.EndpointUrls;
-        var endpointKey = dataType.ToString();
+        var key = dataType.ToString();
 
-        if (endpointUrls.TryGetValue(endpointKey, out var endpointUrl) && !string.IsNullOrWhiteSpace(endpointUrl))
-        {
-            return endpointUrl;
-        }
+        if (_options.Value.EndpointUrls.TryGetValue(key, out var url) && !string.IsNullOrWhiteSpace(url))
+            return url;
 
-        throw new InvalidOperationException($"No endpoint URL configured for '{endpointKey}'.");
+        throw new InvalidOperationException($"No endpoint URL configured for '{key}'.");
     }
 }
